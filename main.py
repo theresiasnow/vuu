@@ -5,7 +5,7 @@ from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QPushButton, QTableWidget, QTableWidgetItem,
-    QHeaderView, QStatusBar, QMessageBox, QFileDialog,
+    QHeaderView, QStatusBar, QMessageBox, QFileDialog, QProgressBar,
 )
 import csv
 import uvk5
@@ -24,7 +24,6 @@ class ImportWorker(QThread):
         self.port = port
 
     def run(self):
-        import traceback
         try:
             with serial.Serial(self.port, uvk5.BAUD_RATE, timeout=3) as ser:
                 self.status.emit("Handshaking...")
@@ -34,7 +33,33 @@ class ImportWorker(QThread):
                 channels = uvk5.read_all_channels(ser, session_id)
                 self.finished.emit(channels)
         except Exception as exc:
-            traceback.print_exc()
+            self.error.emit(f"{type(exc).__name__}: {exc}")
+
+
+class WriteWorker(QThread):
+    finished = Signal()
+    error = Signal(str)
+    status = Signal(str)
+    progress = Signal(int, int)
+
+    def __init__(self, port: str, channels: list[dict]):
+        super().__init__()
+        self.port = port
+        self.channels = channels
+
+    def run(self):
+        try:
+            with serial.Serial(self.port, uvk5.BAUD_RATE, timeout=3) as ser:
+                self.status.emit("Handshaking...")
+                version, session_id = uvk5.handshake(ser)
+                self.status.emit(f"Connected — firmware: {version}")
+                self.status.emit("Writing channels...")
+                uvk5.write_all_channels(
+                    ser, self.channels, session_id,
+                    progress=lambda n, t: self.progress.emit(n, t),
+                )
+                self.finished.emit()
+        except Exception as exc:
             self.error.emit(f"{type(exc).__name__}: {exc}")
 
 
@@ -68,6 +93,10 @@ class MainWindow(QMainWindow):
         self.import_btn.setDefault(True)
         self.import_btn.clicked.connect(self._start_import)
         top.addWidget(self.import_btn)
+        self.write_btn = QPushButton("Write to radio")
+        self.write_btn.setEnabled(False)
+        self.write_btn.clicked.connect(self._start_write)
+        top.addWidget(self.write_btn)
         top.addStretch()
         self.export_btn = QPushButton("Export CSV...")
         self.export_btn.setEnabled(False)
@@ -81,7 +110,9 @@ class MainWindow(QMainWindow):
         # --- table ---
         self.table = QTableWidget(0, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        # Interactive resize: we resizeColumnsToContents() once after a fill
+        # rather than on every cell write (which would be O(rows*cols)).
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(False)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -89,6 +120,11 @@ class MainWindow(QMainWindow):
         root.addWidget(self.table)
 
         self.status_bar = QStatusBar()
+        self.progress = QProgressBar()
+        self.progress.setMaximumWidth(180)
+        self.progress.setTextVisible(False)
+        self.progress.hide()
+        self.status_bar.addPermanentWidget(self.progress)
         self.setStatusBar(self.status_bar)
 
         self._refresh_ports()
@@ -134,30 +170,108 @@ class MainWindow(QMainWindow):
         self._refresh_table()
         self.import_btn.setEnabled(True)
         self.export_btn.setEnabled(True)
+        self.write_btn.setEnabled(bool(channels))
         self.status_bar.showMessage(f"Imported {len(channels)} channels.")
 
+    def _start_write(self):
+        port = self.port_combo.currentData()
+        if not port:
+            QMessageBox.warning(self, "No port", "Select a serial port first.")
+            return
+        if not self._channels:
+            return
+        confirm = QMessageBox(self)
+        confirm.setIcon(QMessageBox.Warning)
+        confirm.setWindowTitle("Write to radio")
+        confirm.setText(f"Overwrite all 200 channel slots on the radio?")
+        confirm.setInformativeText(
+            f"{len(self._channels)} channel(s) will be written; "
+            "remaining slots will be erased. This cannot be undone."
+        )
+        write_btn = confirm.addButton("Write", QMessageBox.DestructiveRole)
+        confirm.addButton(QMessageBox.Cancel)
+        confirm.exec()
+        if confirm.clickedButton() is not write_btn:
+            return
+
+        self.import_btn.setEnabled(False)
+        self.export_btn.setEnabled(False)
+        self.write_btn.setEnabled(False)
+        self.import_csv_btn.setEnabled(False)
+        self.progress.setRange(0, 0)
+        self.progress.show()
+        self._writer = WriteWorker(port, self._channels)
+        self._writer.progress.connect(self._on_write_progress)
+        self._writer.status.connect(self.status_bar.showMessage)
+        self._writer.finished.connect(self._on_write_finished)
+        self._writer.error.connect(self._on_write_error)
+        self._writer.start()
+
+    def _on_write_progress(self, done: int, total: int):
+        self.progress.setRange(0, total)
+        self.progress.setValue(done)
+        self.status_bar.showMessage(f"Writing block {done}/{total}...")
+
+    def _on_write_finished(self):
+        self.progress.hide()
+        self.import_btn.setEnabled(True)
+        self.export_btn.setEnabled(True)
+        self.write_btn.setEnabled(True)
+        self.import_csv_btn.setEnabled(True)
+        self.status_bar.showMessage(f"Wrote {len(self._channels)} channels to radio.")
+
+    def _on_write_error(self, msg: str):
+        self.progress.hide()
+        self.import_btn.setEnabled(True)
+        self.export_btn.setEnabled(True)
+        self.write_btn.setEnabled(True)
+        self.import_csv_btn.setEnabled(True)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Critical)
+        box.setWindowTitle("Write failed")
+        box.setText("Write failed")
+        box.setInformativeText(msg)
+        box.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        box.exec()
+        self.status_bar.showMessage(f"Error: {msg}")
+
     def _refresh_table(self):
-        self.table.setRowCount(len(self._channels))
-        for row, ch in enumerate(self._channels):
-            freq_mhz = ch["freq_hz"] / 1_000_000
-            offset_mhz = ch["offset_hz"] / 1_000_000
-            values = [
-                str(ch["index"] + 1),
-                ch["name"],
-                f"{freq_mhz:.5f} MHz",
-                ch["duplex"],
-                f"{offset_mhz:.4f} MHz" if ch["offset_hz"] else "",
-                ch["mode"],
-                ch["tx_tone"],
-                ch["rx_tone"],
-                ch["power"],
-                f"{ch['step_khz']} kHz",
-                "Yes" if ch["bclo"] else "",
-            ]
-            for col, val in enumerate(values):
-                item = QTableWidgetItem(val)
-                item.setTextAlignment(Qt.AlignCenter if col != 1 else Qt.AlignLeft | Qt.AlignVCenter)
-                self.table.setItem(row, col, item)
+        n = len(self._channels)
+        self.progress.setRange(0, n)
+        self.progress.setValue(0)
+        self.progress.show()
+        self.table.setUpdatesEnabled(False)
+        self.table.setSortingEnabled(False)
+        try:
+            self.table.setRowCount(n)
+            for row, ch in enumerate(self._channels):
+                freq_mhz = ch["freq_hz"] / 1_000_000
+                offset_mhz = ch["offset_hz"] / 1_000_000
+                values = [
+                    str(ch["index"] + 1),
+                    ch["name"],
+                    f"{freq_mhz:.5f} MHz",
+                    ch["duplex"],
+                    f"{offset_mhz:.4f} MHz" if ch["offset_hz"] else "",
+                    ch["mode"],
+                    ch["tx_tone"],
+                    ch["rx_tone"],
+                    ch["power"],
+                    f"{ch['step_khz']} kHz",
+                    "Yes" if ch["bclo"] else "",
+                ]
+                for col, val in enumerate(values):
+                    item = QTableWidgetItem(val)
+                    item.setTextAlignment(Qt.AlignCenter if col != 1 else Qt.AlignLeft | Qt.AlignVCenter)
+                    self.table.setItem(row, col, item)
+                if row % 25 == 0:
+                    self.progress.setValue(row)
+                    QApplication.processEvents()
+        finally:
+            self.table.setUpdatesEnabled(True)
+            self.table.resizeColumnsToContents()
+            self.progress.setValue(n)
+            self.progress.hide()
 
     def _on_error(self, msg: str):
         self.import_btn.setEnabled(True)
@@ -248,23 +362,37 @@ class MainWindow(QMainWindow):
 
         self._refresh_table()
         self.export_btn.setEnabled(True)
+        self.write_btn.setEnabled(bool(self._channels))
         self.status_bar.showMessage(
             f"{mode.capitalize()}d {len(rows)} channel(s) from {fmt} CSV — total now {len(self._channels)}."
         )
 
 
-def _parse_csv_row(row: dict) -> dict:
+def _parse_csv_row(row: dict) -> dict | None:
     """Coerce VUU-format CSV strings back into the channel-dict types used internally."""
     def _to_bool(v):
         return str(v).strip().lower() in ("1", "true", "yes", "y")
+    def _norm(v):
+        s = (v or "").strip()
+        return s if s and s != "?" else "None"
+    try:
+        freq_hz = int(row["freq_hz"])
+    except (TypeError, ValueError, KeyError):
+        return None
+    # 0xFFFFFFFF * 10 = 42949672950 Hz — erased EEPROM slot, not a real channel.
+    if freq_hz <= 0 or freq_hz >= 42949672950:
+        return None
+    offset_hz = int(row.get("offset_hz") or 0)
+    if offset_hz < 0 or offset_hz >= 42949672950:
+        offset_hz = 0
     return {
         "index": int(row["index"]),
         "name": row.get("name", "").strip(),
-        "freq_hz": int(row["freq_hz"]),
-        "offset_hz": int(row.get("offset_hz") or 0),
+        "freq_hz": freq_hz,
+        "offset_hz": offset_hz,
         "duplex": row.get("duplex", "") or "",
-        "tx_tone": row.get("tx_tone", "None") or "None",
-        "rx_tone": row.get("rx_tone", "None") or "None",
+        "tx_tone": _norm(row.get("tx_tone")),
+        "rx_tone": _norm(row.get("rx_tone")),
         "mode": row.get("mode", "FM") or "FM",
         "power": row.get("power", "Low (1.5W)") or "Low (1.5W)",
         "step_khz": float(row.get("step_khz") or 5.0),

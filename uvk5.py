@@ -48,9 +48,6 @@ def _xor(data: bytes) -> bytes:
     return bytes(b ^ _XOR_KEY[i % 16] for i, b in enumerate(data))
 
 
-DEBUG = False
-
-
 def _send_cmd(ser: serial.Serial, cmd: bytes) -> None:
     """Frame and send a cleartext command. cmd = id(2) + size(2) + payload."""
     crc = _crc16(cmd)
@@ -60,8 +57,6 @@ def _send_cmd(ser: serial.Serial, cmd: bytes) -> None:
              obfuscated +
              b"\xdc\xba")
     ser.reset_input_buffer()
-    if DEBUG:
-        print(f"[TX] {frame.hex()}")
     ser.write(frame)
 
 
@@ -81,8 +76,6 @@ def _recv_cmd(ser: serial.Serial) -> bytes:
     if footer != b"\xdc\xba":
         raise IOError(f"Bad footer: {footer.hex()}")
     cleartext = _xor(body)
-    if DEBUG:
-        print(f"[RX] hdr={hdr.hex()} body={body.hex()} ftr={footer.hex()}  -> clear={cleartext.hex()}")
     # Radio sends 0xffff instead of a real CRC — don't validate.
     return cleartext[:-2]
 
@@ -125,8 +118,8 @@ def read_all_channels(ser: serial.Serial, session_id: bytes | None = None) -> li
     attr_data = read_eeprom(ser, 0x0D60, 200, session_id)
 
     name_data = b""
-    for block_start in range(0x0F50, 0x1050, MEM_BLOCK):
-        block_len = min(MEM_BLOCK, 0x1050 - block_start)
+    for block_start in range(0x0F50, 0x1BD0, MEM_BLOCK):
+        block_len = min(MEM_BLOCK, 0x1BD0 - block_start)
         name_data += read_eeprom(ser, block_start, block_len, session_id)
 
     channels = []
@@ -140,6 +133,10 @@ def read_all_channels(ser: serial.Serial, session_id: bytes | None = None) -> li
             continue
 
         freq_raw, offset_raw = struct.unpack_from("<II", entry, 0)
+        if freq_raw in (0x00000000, 0xFFFFFFFF):
+            continue
+        if offset_raw == 0xFFFFFFFF:
+            offset_raw = 0
         rx_code = entry[8]
         tx_code = entry[9]
         code_flags = entry[10]
@@ -161,8 +158,8 @@ def read_all_channels(ser: serial.Serial, session_id: bytes | None = None) -> li
             if mode == 0:
                 return "None"
             if mode == 1:
-                return f"{CTCSS_TONES[code]:.1f} Hz" if code < len(CTCSS_TONES) else "?"
-            return f"D{DCS_CODES[code]:03d}N" if code < len(DCS_CODES) else "?"
+                return f"{CTCSS_TONES[code]:.1f} Hz" if code < len(CTCSS_TONES) else "None"
+            return f"D{DCS_CODES[code]:03d}N" if code < len(DCS_CODES) else "None"
 
         duplex = ["", "-", "+"][shift] if shift < 3 else ""
 
@@ -183,3 +180,147 @@ def read_all_channels(ser: serial.Serial, session_id: bytes | None = None) -> li
         })
 
     return channels
+
+
+def _parse_tone(label: str) -> tuple[int, int]:
+    """Return (mode, code). mode: 0=None, 1=CTCSS, 2=DCS."""
+    s = (label or "").strip()
+    if not s or s.lower() in ("none", "?", "off"):
+        return 0, 0
+    if s.upper().startswith("D"):
+        try:
+            num = int(s[1:].rstrip("NIni"))
+            return 2, DCS_CODES.index(num)
+        except (ValueError, IndexError):
+            return 0, 0
+    try:
+        hz = float(s.split()[0])
+        nearest = min(range(len(CTCSS_TONES)), key=lambda i: abs(CTCSS_TONES[i] - hz))
+        return 1, nearest
+    except (ValueError, IndexError):
+        return 0, 0
+
+
+def _encode_channel(ch: dict) -> tuple[bytes, int, bytes]:
+    """Return (entry_16, attr_byte, name_16) for a channel dict."""
+    freq_raw = int(round(ch["freq_hz"] / 10))
+    offset_raw = int(round(ch.get("offset_hz", 0) / 10))
+
+    rx_mode, rx_code = _parse_tone(ch.get("rx_tone", "None"))
+    tx_mode, tx_code = _parse_tone(ch.get("tx_tone", "None"))
+    code_flags = (rx_mode << 4) | (tx_mode & 0x0F)
+
+    duplex = ch.get("duplex") or ""
+    shift = {"": 0, "-": 1, "+": 2}.get(duplex, 0)
+    mode = (ch.get("mode") or "FM").upper()
+    enable_am = mode == "AM"
+    bandwidth_narrow = mode == "NFM"
+    flags1 = shift & 0x03
+    if enable_am:
+        flags1 |= 0x08
+
+    power_label = ch.get("power") or POWER_LABELS[0]
+    try:
+        tx_power = POWER_LABELS.index(power_label)
+    except ValueError:
+        tx_power = 0
+    flags2 = ((tx_power & 0x03) << 2)
+    if bandwidth_narrow:
+        flags2 |= 0x02
+    if ch.get("bclo"):
+        flags2 |= 0x10
+
+    step_khz = ch.get("step_khz", 5.0)
+    try:
+        step_idx = STEPS_KHZ.index(float(step_khz))
+    except ValueError:
+        step_idx = min(range(len(STEPS_KHZ)),
+                       key=lambda i: abs(STEPS_KHZ[i] - float(step_khz)))
+
+    entry = bytearray(16)
+    struct.pack_into("<II", entry, 0, freq_raw & 0xFFFFFFFF, offset_raw & 0xFFFFFFFF)
+    entry[8] = rx_code & 0xFF
+    entry[9] = tx_code & 0xFF
+    entry[10] = code_flags & 0xFF
+    entry[11] = flags1 & 0xFF
+    entry[12] = flags2 & 0xFF
+    entry[13] = 0xFF
+    entry[14] = step_idx & 0xFF
+    entry[15] = 0xFF
+
+    # attr: bit0 scanlist1, bit1 scanlist2, bit4 free (0=in use). Upper bits left set.
+    attr = 0xEC  # default upper bits per k5prog
+    if ch.get("scanlist1"):
+        attr |= 0x01
+    if ch.get("scanlist2"):
+        attr |= 0x02
+    attr &= ~0x10  # in-use
+
+    name_bytes = (ch.get("name") or "").encode("ascii", errors="replace")[:16]
+    name = name_bytes + b"\x00" * (16 - len(name_bytes))
+
+    return bytes(entry), attr & 0xFF, name
+
+
+_FREE_ENTRY = b"\xFF" * 16
+_FREE_ATTR = 0xFF
+_FREE_NAME = b"\xFF" * 16
+
+
+def write_eeprom(ser: serial.Serial, offset: int, data: bytes,
+                 session_id: bytes = SESSION_ID) -> None:
+    """Write `data` (max 0x80 bytes) to EEPROM at `offset`."""
+    if len(data) > MEM_BLOCK:
+        raise ValueError(f"write_eeprom: too large ({len(data)} > {MEM_BLOCK})")
+    cmd = (bytes([0x1D, 0x05, len(data) + 8, 0x00]) +
+           struct.pack("<HBB", offset, len(data), 0) +
+           session_id +
+           data)
+    _send_cmd(ser, cmd)
+    reply = _recv_cmd(ser)
+    if len(reply) < 4 or reply[0] != 0x1E or reply[1] != 0x05:
+        raise IOError(f"write_eeprom 0x{offset:04x}: bad reply ({reply[:4].hex()})")
+
+
+def write_all_channels(ser: serial.Serial, channels: list[dict],
+                       session_id: bytes | None = None,
+                       progress=None) -> None:
+    """Write all 200 channel slots. `channels` may be sparse (by 'index').
+
+    `progress(done, total)` is called after each EEPROM block written.
+    """
+    if session_id is None:
+        _, session_id = handshake(ser)
+
+    by_index: dict[int, dict] = {}
+    for ch in channels:
+        idx = ch.get("index")
+        if idx is None or not (0 <= idx < 200):
+            continue
+        by_index[idx] = ch
+
+    chan_buf = bytearray(200 * 16)
+    attr_buf = bytearray([_FREE_ATTR] * 200)
+    name_buf = bytearray(200 * 16)
+    for i in range(200):
+        if i in by_index:
+            entry, attr, name = _encode_channel(by_index[i])
+        else:
+            entry, attr, name = _FREE_ENTRY, _FREE_ATTR, _FREE_NAME
+        chan_buf[i * 16:(i + 1) * 16] = entry
+        attr_buf[i] = attr
+        name_buf[i * 16:(i + 1) * 16] = name
+
+    # Total blocks: chan (0x0C80/0x80=25) + attr (1, 200 bytes <= 0x80? 200 > 128, so 2) + names (0x100/0x80=2)
+    chan_blocks = [(0x0000 + s, bytes(chan_buf[s:s + min(MEM_BLOCK, len(chan_buf) - s)]))
+                   for s in range(0, len(chan_buf), MEM_BLOCK)]
+    attr_blocks = [(0x0D60 + s, bytes(attr_buf[s:s + min(MEM_BLOCK, len(attr_buf) - s)]))
+                   for s in range(0, len(attr_buf), MEM_BLOCK)]
+    name_blocks = [(0x0F50 + s, bytes(name_buf[s:s + min(MEM_BLOCK, len(name_buf) - s)]))
+                   for s in range(0, len(name_buf), MEM_BLOCK)]
+    blocks = chan_blocks + attr_blocks + name_blocks
+    total = len(blocks)
+    for n, (offset, data) in enumerate(blocks, 1):
+        write_eeprom(ser, offset, data, session_id)
+        if progress is not None:
+            progress(n, total)
