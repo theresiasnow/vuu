@@ -66,6 +66,47 @@ Requires **Python 3.14+**, PySide6, and pyserial.
 - Quanzheng **UV-K5**, **UV-K5(8)**, **UV-K6** (CH340 USB-serial chip).
 - Stock and custom firmware — channel layout is identical across them.
 
+## Contributing
+
+This project uses [**Commitizen**](https://commitizen-tools.github.io/commitizen/)
+with [Conventional Commits](https://www.conventionalcommits.org/) for
+automated semantic versioning and changelog generation.
+
+### Commit messages
+
+Use the conventional format:
+
+```
+<type>(<scope>): <description>
+
+[optional body]
+
+[optional footer(s)]
+```
+
+Common types: `feat`, `fix`, `docs`, `refactor`, `perf`, `test`, `chore`,
+`build`, `ci`. A `feat!:` or `BREAKING CHANGE:` footer triggers a major bump.
+
+You can run the interactive prompt:
+
+```bash
+uv run cz commit
+```
+
+### Cutting a release
+
+Commitizen reads commits since the last tag, bumps the version in
+`pyproject.toml`, updates `CHANGELOG.md`, commits, and creates the
+git tag — all in one command:
+
+```bash
+uv run cz bump --yes
+git push --follow-tags
+```
+
+The `Release` GitHub Actions workflow then builds the wheel + sdist
+and publishes a GitHub Release with assets.
+
 ## License
 
 MIT
