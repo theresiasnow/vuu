@@ -188,12 +188,31 @@ class MainWindow(QMainWindow):
             return
         try:
             with open(path, newline="", encoding="utf-8") as f:
-                rows = [_parse_csv_row(r) for r in csv.DictReader(f)]
+                reader = csv.DictReader(f)
+                fields = set(reader.fieldnames or [])
+                if "Location" in fields and "Frequency" in fields:
+                    parser, fmt = _parse_chirp_row, "CHIRP"
+                elif "index" in fields and "freq_hz" in fields:
+                    parser, fmt = _parse_csv_row, "VUU"
+                else:
+                    QMessageBox.critical(
+                        self, "Unknown CSV format",
+                        f"Could not recognize CSV columns: {sorted(fields)}",
+                    )
+                    return
+                rows = []
+                for r in reader:
+                    parsed = parser(r)
+                    if parsed is None:
+                        continue
+                    if not (0 <= parsed["index"] < 200):
+                        continue
+                    rows.append(parsed)
         except Exception as exc:
             QMessageBox.critical(self, "Import failed", f"Could not read CSV:\n{exc}")
             return
         if not rows:
-            QMessageBox.warning(self, "Empty CSV", "No channels found in file.")
+            QMessageBox.warning(self, "Empty CSV", "No usable channels found in file.")
             return
 
         mode = "replace"
@@ -201,7 +220,7 @@ class MainWindow(QMainWindow):
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Question)
             box.setWindowTitle("Import CSV")
-            box.setText(f"Loaded {len(rows)} channels from CSV.")
+            box.setText(f"Loaded {len(rows)} channels from {fmt} CSV.")
             box.setInformativeText(
                 "Replace current channels, or merge by channel index "
                 "(CSV entries overwrite matching slots, others kept)?"
@@ -230,12 +249,12 @@ class MainWindow(QMainWindow):
         self._refresh_table()
         self.export_btn.setEnabled(True)
         self.status_bar.showMessage(
-            f"{mode.capitalize()}d {len(rows)} channel(s) from CSV — total now {len(self._channels)}."
+            f"{mode.capitalize()}d {len(rows)} channel(s) from {fmt} CSV — total now {len(self._channels)}."
         )
 
 
 def _parse_csv_row(row: dict) -> dict:
-    """Coerce CSV strings back into the channel-dict types used internally."""
+    """Coerce VUU-format CSV strings back into the channel-dict types used internally."""
     def _to_bool(v):
         return str(v).strip().lower() in ("1", "true", "yes", "y")
     return {
@@ -252,6 +271,81 @@ def _parse_csv_row(row: dict) -> dict:
         "bclo": _to_bool(row.get("bclo")),
         "scanlist1": _to_bool(row.get("scanlist1")),
         "scanlist2": _to_bool(row.get("scanlist2")),
+    }
+
+
+def _parse_chirp_row(row: dict) -> dict | None:
+    """Convert a CHIRP CSV row into VUU's internal channel dict, or None to skip."""
+    try:
+        loc = int(row["Location"])
+        freq_mhz = float(row["Frequency"])
+    except (TypeError, ValueError, KeyError):
+        return None
+
+    def _ctcss(v):
+        try:
+            return f"{float(v):.1f} Hz"
+        except (TypeError, ValueError):
+            return "None"
+
+    def _dcs(v):
+        try:
+            return f"D{int(v):03d}N"
+        except (TypeError, ValueError):
+            return "None"
+
+    tone_kind = (row.get("Tone") or "").strip()
+    rtone, ctone = row.get("rToneFreq"), row.get("cToneFreq")
+    dcs_code, rx_dcs = row.get("DtcsCode"), row.get("RxDtcsCode")
+    if tone_kind == "Tone":
+        tx_tone, rx_tone = _ctcss(rtone), "None"
+    elif tone_kind in ("TSQL", "TSQL-R"):
+        tx_tone = rx_tone = _ctcss(ctone)
+    elif tone_kind in ("DTCS", "DTCS-R"):
+        tx_tone = _dcs(dcs_code)
+        rx_tone = _dcs(rx_dcs or dcs_code)
+    else:
+        tx_tone = rx_tone = "None"
+
+    duplex = (row.get("Duplex") or "").strip()
+    if duplex not in ("", "+", "-"):
+        duplex = ""
+
+    chirp_mode = (row.get("Mode") or "FM").upper()
+    mode = chirp_mode if chirp_mode in ("FM", "NFM", "AM") else "FM"
+
+    try:
+        step_khz = float(row.get("TStep") or 5.0)
+    except ValueError:
+        step_khz = 5.0
+
+    pwr = (row.get("Power") or "").lower()
+    if "high" in pwr or pwr.startswith("5"):
+        power = "High (5W)"
+    elif "mid" in pwr or "med" in pwr or pwr.startswith("3"):
+        power = "Med (3W)"
+    else:
+        power = "Low (1.5W)"
+
+    try:
+        offset_hz = round(float(row.get("Offset") or 0) * 1_000_000)
+    except ValueError:
+        offset_hz = 0
+
+    return {
+        "index": loc - 1,
+        "name": (row.get("Name") or "").strip(),
+        "freq_hz": round(freq_mhz * 1_000_000),
+        "offset_hz": offset_hz,
+        "duplex": duplex,
+        "tx_tone": tx_tone,
+        "rx_tone": rx_tone,
+        "mode": mode,
+        "power": power,
+        "step_khz": step_khz,
+        "bclo": False,
+        "scanlist1": (row.get("Skip") or "").strip().upper() != "S",
+        "scanlist2": False,
     }
 
 
