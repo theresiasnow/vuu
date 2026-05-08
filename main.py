@@ -73,6 +73,9 @@ class MainWindow(QMainWindow):
         self.export_btn.setEnabled(False)
         self.export_btn.clicked.connect(self._export_csv)
         top.addWidget(self.export_btn)
+        self.import_csv_btn = QPushButton("Import CSV...")
+        self.import_csv_btn.clicked.connect(self._import_csv)
+        top.addWidget(self.import_csv_btn)
         root.addLayout(top)
 
         # --- table ---
@@ -128,8 +131,14 @@ class MainWindow(QMainWindow):
 
     def _on_finished(self, channels: list[dict]):
         self._channels = channels
-        self.table.setRowCount(len(channels))
-        for row, ch in enumerate(channels):
+        self._refresh_table()
+        self.import_btn.setEnabled(True)
+        self.export_btn.setEnabled(True)
+        self.status_bar.showMessage(f"Imported {len(channels)} channels.")
+
+    def _refresh_table(self):
+        self.table.setRowCount(len(self._channels))
+        for row, ch in enumerate(self._channels):
             freq_mhz = ch["freq_hz"] / 1_000_000
             offset_mhz = ch["offset_hz"] / 1_000_000
             values = [
@@ -149,10 +158,6 @@ class MainWindow(QMainWindow):
                 item = QTableWidgetItem(val)
                 item.setTextAlignment(Qt.AlignCenter if col != 1 else Qt.AlignLeft | Qt.AlignVCenter)
                 self.table.setItem(row, col, item)
-
-        self.import_btn.setEnabled(True)
-        self.export_btn.setEnabled(True)
-        self.status_bar.showMessage(f"Imported {len(channels)} channels.")
 
     def _on_error(self, msg: str):
         self.import_btn.setEnabled(True)
@@ -176,6 +181,78 @@ class MainWindow(QMainWindow):
             writer.writeheader()
             writer.writerows(self._channels)
         self.status_bar.showMessage(f"Saved {len(self._channels)} channels to {path}")
+
+    def _import_csv(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV files (*.csv)")
+        if not path:
+            return
+        try:
+            with open(path, newline="", encoding="utf-8") as f:
+                rows = [_parse_csv_row(r) for r in csv.DictReader(f)]
+        except Exception as exc:
+            QMessageBox.critical(self, "Import failed", f"Could not read CSV:\n{exc}")
+            return
+        if not rows:
+            QMessageBox.warning(self, "Empty CSV", "No channels found in file.")
+            return
+
+        mode = "replace"
+        if self._channels:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Question)
+            box.setWindowTitle("Import CSV")
+            box.setText(f"Loaded {len(rows)} channels from CSV.")
+            box.setInformativeText(
+                "Replace current channels, or merge by channel index "
+                "(CSV entries overwrite matching slots, others kept)?"
+            )
+            replace_btn = box.addButton("Replace", QMessageBox.DestructiveRole)
+            merge_btn = box.addButton("Merge", QMessageBox.AcceptRole)
+            box.addButton(QMessageBox.Cancel)
+            box.setDefaultButton(merge_btn)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is replace_btn:
+                mode = "replace"
+            elif clicked is merge_btn:
+                mode = "merge"
+            else:
+                return
+
+        if mode == "replace":
+            self._channels = sorted(rows, key=lambda c: c["index"])
+        else:
+            by_index = {c["index"]: c for c in self._channels}
+            for r in rows:
+                by_index[r["index"]] = r
+            self._channels = sorted(by_index.values(), key=lambda c: c["index"])
+
+        self._refresh_table()
+        self.export_btn.setEnabled(True)
+        self.status_bar.showMessage(
+            f"{mode.capitalize()}d {len(rows)} channel(s) from CSV — total now {len(self._channels)}."
+        )
+
+
+def _parse_csv_row(row: dict) -> dict:
+    """Coerce CSV strings back into the channel-dict types used internally."""
+    def _to_bool(v):
+        return str(v).strip().lower() in ("1", "true", "yes", "y")
+    return {
+        "index": int(row["index"]),
+        "name": row.get("name", "").strip(),
+        "freq_hz": int(row["freq_hz"]),
+        "offset_hz": int(row.get("offset_hz") or 0),
+        "duplex": row.get("duplex", "") or "",
+        "tx_tone": row.get("tx_tone", "None") or "None",
+        "rx_tone": row.get("rx_tone", "None") or "None",
+        "mode": row.get("mode", "FM") or "FM",
+        "power": row.get("power", "Low (1.5W)") or "Low (1.5W)",
+        "step_khz": float(row.get("step_khz") or 5.0),
+        "bclo": _to_bool(row.get("bclo")),
+        "scanlist1": _to_bool(row.get("scanlist1")),
+        "scanlist2": _to_bool(row.get("scanlist2")),
+    }
 
 
 def main():
