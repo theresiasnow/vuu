@@ -27,10 +27,10 @@ class ImportWorker(QThread):
         try:
             with serial.Serial(self.port, uvk5.BAUD_RATE, timeout=3) as ser:
                 self.status.emit("Handshaking...")
-                fw = uvk5.handshake(ser)
-                self.status.emit(f"Connected — firmware: {fw}")
+                version, timestamp = uvk5.handshake(ser)
+                self.status.emit(f"Connected — firmware: {version}")
                 self.status.emit("Reading channels...")
-                channels = uvk5.read_all_channels(ser)
+                channels = uvk5.read_all_channels(ser, timestamp)
                 self.finished.emit(channels)
         except Exception as exc:
             self.error.emit(str(exc))
@@ -90,12 +90,25 @@ class MainWindow(QMainWindow):
 
     def _refresh_ports(self):
         self.port_combo.clear()
-        ports = serial.tools.list_ports.comports()
+        all_ports = serial.tools.list_ports.comports()
+        # UV-K5 uses a CH340 USB-serial chip (VID 0x1A86, PID 0x7523)
+        radio_ports = [
+            p for p in all_ports
+            if getattr(p, "vid", None) == 0x1A86
+            or "ch340" in (p.description or "").lower()
+            or "ch341" in (p.description or "").lower()
+        ]
+        ports = radio_ports or all_ports
         for p in ports:
             self.port_combo.addItem(f"{p.device} — {p.description}", p.device)
         if not ports:
             self.port_combo.addItem("No ports found", "")
-        self.status_bar.showMessage(f"{len(ports)} serial port(s) found")
+        if radio_ports:
+            self.status_bar.showMessage(f"Found {len(radio_ports)} UV-K5 radio port(s)")
+        elif all_ports:
+            self.status_bar.showMessage(f"No radio detected — showing all {len(all_ports)} port(s)")
+        else:
+            self.status_bar.showMessage("No serial ports found")
 
     def _start_import(self):
         port = self.port_combo.currentData()
