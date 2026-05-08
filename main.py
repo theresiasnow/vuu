@@ -24,16 +24,18 @@ class ImportWorker(QThread):
         self.port = port
 
     def run(self):
+        import traceback
         try:
             with serial.Serial(self.port, uvk5.BAUD_RATE, timeout=3) as ser:
                 self.status.emit("Handshaking...")
-                version, timestamp = uvk5.handshake(ser)
+                version, session_id = uvk5.handshake(ser)
                 self.status.emit(f"Connected — firmware: {version}")
                 self.status.emit("Reading channels...")
-                channels = uvk5.read_all_channels(ser, timestamp)
+                channels = uvk5.read_all_channels(ser, session_id)
                 self.finished.emit(channels)
         except Exception as exc:
-            self.error.emit(str(exc))
+            traceback.print_exc()
+            self.error.emit(f"{type(exc).__name__}: {exc}")
 
 
 class MainWindow(QMainWindow):
@@ -154,7 +156,13 @@ class MainWindow(QMainWindow):
 
     def _on_error(self, msg: str):
         self.import_btn.setEnabled(True)
-        QMessageBox.critical(self, "Import failed", msg)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Critical)
+        box.setWindowTitle("Import failed")
+        box.setText("Import failed")
+        box.setInformativeText(msg)
+        box.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        box.exec()
         self.status_bar.showMessage(f"Error: {msg}")
 
     def _export_csv(self):

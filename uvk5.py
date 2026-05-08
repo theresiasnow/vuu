@@ -1,6 +1,5 @@
-"""UV-K5 serial protocol — based on VUURWERK/egzumer firmware source."""
+"""UV-K5 serial protocol — based on sq5bpf/k5prog reference implementation."""
 import struct
-import time
 import serial
 
 BAUD_RATE = 38400
@@ -8,6 +7,10 @@ MEM_BLOCK = 0x80
 
 _XOR_KEY = bytes([0x16, 0x6C, 0x14, 0xE6, 0x2E, 0x91, 0x0D, 0x40,
                   0x21, 0x35, 0xD5, 0x40, 0x13, 0x03, 0xE9, 0x80])
+
+# Magic 4-byte "session id" — must be identical on every packet of a session.
+# Per k5prog (uvk5_hello / uvk5_readmem1): 0x6a 0x39 0x57 0x64
+SESSION_ID = bytes([0x6A, 0x39, 0x57, 0x64])
 
 CTCSS_TONES = [
     67.0, 69.3, 71.9, 74.4, 77.0, 79.7, 82.5, 85.4, 88.5, 91.5,
@@ -45,79 +48,86 @@ def _xor(data: bytes) -> bytes:
     return bytes(b ^ _XOR_KEY[i % 16] for i, b in enumerate(data))
 
 
-def _send(ser: serial.Serial, cmd_id: int, payload: bytes, encrypted: bool) -> None:
-    # Header: ID (LE u16) + Size (LE u16)
-    body = struct.pack("<HH", cmd_id, len(payload)) + payload
-    crc = _crc16(body)
-    body_with_crc = body + struct.pack("<H", crc)
-    if encrypted:
-        body_with_crc = _xor(body_with_crc)
-    # Frame: 0xABCD + size_byte + 0x00 + body_with_crc + 0xDCBA
-    frame = (struct.pack(">H", 0xABCD) +
-             bytes([len(body_with_crc) - 2, 0x00]) +
-             body_with_crc +
-             struct.pack(">H", 0xDCBA))
+DEBUG = False
+
+
+def _send_cmd(ser: serial.Serial, cmd: bytes) -> None:
+    """Frame and send a cleartext command. cmd = id(2) + size(2) + payload."""
+    crc = _crc16(cmd)
+    obfuscated = _xor(cmd + struct.pack("<H", crc))
+    frame = (b"\xab\xcd" +
+             struct.pack("<H", len(cmd)) +
+             obfuscated +
+             b"\xdc\xba")
     ser.reset_input_buffer()
+    if DEBUG:
+        print(f"[TX] {frame.hex()}")
     ser.write(frame)
 
 
-def _recv(ser: serial.Serial, encrypted: bool) -> tuple[int, bytes]:
-    """Read one response frame, return (reply_id, data_bytes)."""
-    # Header: 0xABCD (2) + size (1) + 0x00 (1)
+def _recv_cmd(ser: serial.Serial) -> bytes:
+    """Read one response frame, return deobfuscated cleartext cmd (without crc)."""
     hdr = ser.read(4)
-    if len(hdr) < 4 or hdr[0] != 0xAB or hdr[1] != 0xCD:
-        raise IOError(f"Bad response header: {hdr.hex()}")
-    body_len = hdr[2]
-    body = ser.read(body_len)
-    footer = ser.read(4)
-    if len(footer) < 4 or footer[2] != 0xDC or footer[3] != 0xBA:
-        raise IOError(f"Bad response footer: {footer.hex()}")
-    if encrypted:
-        body = _xor(body)
-    # body = reply_id (u16 LE) + size (u16 LE) + data + crc (u16)
-    reply_id = struct.unpack_from("<H", body, 0)[0]
-    data = body[4:-2]
-    return reply_id, data
+    if len(hdr) < 4:
+        raise IOError(f"Timeout waiting for response (got {len(hdr)}/4 hdr bytes: {hdr.hex()})")
+    if hdr[0] != 0xAB or hdr[1] != 0xCD:
+        raise IOError(f"Bad magic: {hdr.hex()}")
+    cmd_len = hdr[2] | (hdr[3] << 8)
+    rest = ser.read(cmd_len + 2 + 2)  # cmd + crc + footer
+    if len(rest) < cmd_len + 4:
+        raise IOError(f"Short read: expected {cmd_len + 4}, got {len(rest)} ({rest.hex()})")
+    body = rest[:cmd_len + 2]  # cmd + crc (encrypted)
+    footer = rest[cmd_len + 2:]
+    if footer != b"\xdc\xba":
+        raise IOError(f"Bad footer: {footer.hex()}")
+    cleartext = _xor(body)
+    if DEBUG:
+        print(f"[RX] hdr={hdr.hex()} body={body.hex()} ftr={footer.hex()}  -> clear={cleartext.hex()}")
+    # Radio sends 0xffff instead of a real CRC — don't validate.
+    return cleartext[:-2]
 
 
-def handshake(ser: serial.Serial) -> tuple[str, int]:
-    """Send CMD_0514, receive REPLY_0515. Returns (firmware_version, timestamp)."""
-    timestamp = int(time.time()) & 0xFFFFFFFF
-    payload = struct.pack("<I", timestamp)
-    _send(ser, 0x0514, payload, encrypted=True)
-    reply_id, data = _recv(ser, encrypted=True)
-    if reply_id != 0x0515:
-        raise IOError(f"Handshake failed — got reply 0x{reply_id:04x}")
-    version = data[0:16].rstrip(b"\x00\xff").decode("ascii", errors="replace")
-    return version, timestamp
+def handshake(ser: serial.Serial) -> tuple[str, bytes]:
+    """Send hello, return (firmware_version, session_id)."""
+    cmd = bytes([0x14, 0x05, 0x04, 0x00]) + SESSION_ID
+    _send_cmd(ser, cmd)
+    reply = _recv_cmd(ser)
+    if len(reply) < 4 or reply[0] != 0x15 or reply[1] != 0x05:
+        raise IOError(f"Handshake failed — reply: {reply.hex()}")
+    # reply layout: id(2) + size(2) + version(16) + ...
+    version = reply[4:20].rstrip(b"\x00\xff").decode("ascii", errors="replace").strip()
+    return version, SESSION_ID
 
 
-def read_eeprom(ser: serial.Serial, offset: int, length: int, timestamp: int) -> bytes:
-    """Send CMD_051B, receive REPLY_051C."""
-    payload = struct.pack("<HBBI", offset, length, 0, timestamp)
-    _send(ser, 0x051B, payload, encrypted=False)
-    reply_id, data = _recv(ser, encrypted=True)
-    if reply_id != 0x051C:
-        raise IOError(f"read_eeprom: got reply 0x{reply_id:04x}")
-    return data[4:4 + length]
+def read_eeprom(ser: serial.Serial, offset: int, length: int, session_id: bytes = SESSION_ID) -> bytes:
+    """Read `length` bytes from EEPROM at `offset`. length max = 0x80."""
+    cmd = (bytes([0x1B, 0x05, 0x08, 0x00]) +
+           struct.pack("<HBB", offset, length, 0) +
+           session_id)
+    _send_cmd(ser, cmd)
+    reply = _recv_cmd(ser)
+    if len(reply) < 8 or reply[0] != 0x1C or reply[1] != 0x05:
+        raise IOError(f"read_eeprom 0x{offset:04x}: bad reply id ({reply[:4].hex()})")
+    # reply: id(2) + size(2) + offset(2) + length(1) + 0(1) + data
+    return reply[8:8 + length]
 
 
-def read_all_channels(ser: serial.Serial, timestamp: int | None = None) -> list[dict]:
+def read_all_channels(ser: serial.Serial, session_id: bytes | None = None) -> list[dict]:
     """Read all 200 channel slots and return list of channel dicts."""
-    if timestamp is None:
-        _, timestamp = handshake(ser)
+    if session_id is None:
+        _, session_id = handshake(ser)
 
     chan_data = b""
     for block_start in range(0x0000, 0x0C80, MEM_BLOCK):
         block_len = min(MEM_BLOCK, 0x0C80 - block_start)
-        chan_data += read_eeprom(ser, block_start, block_len, timestamp)
+        chan_data += read_eeprom(ser, block_start, block_len, session_id)
 
-    attr_data = read_eeprom(ser, 0x0D60, 200, timestamp)
+    attr_data = read_eeprom(ser, 0x0D60, 200, session_id)
 
     name_data = b""
     for block_start in range(0x0F50, 0x1050, MEM_BLOCK):
         block_len = min(MEM_BLOCK, 0x1050 - block_start)
-        name_data += read_eeprom(ser, block_start, block_len, timestamp)
+        name_data += read_eeprom(ser, block_start, block_len, session_id)
 
     channels = []
     for i in range(200):
