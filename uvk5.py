@@ -85,7 +85,7 @@ def handshake(ser: serial.Serial) -> tuple[str, int]:
     timestamp = int(time.time()) & 0xFFFFFFFF
     payload = struct.pack("<I", timestamp)
     _send(ser, 0x0514, payload, encrypted=True)
-    reply_id, data = _recv(ser, encrypted=False)
+    reply_id, data = _recv(ser, encrypted=True)
     if reply_id != 0x0515:
         raise IOError(f"Handshake failed — got reply 0x{reply_id:04x}")
     version = data[0:16].rstrip(b"\x00\xff").decode("ascii", errors="replace")
@@ -96,7 +96,7 @@ def read_eeprom(ser: serial.Serial, offset: int, length: int, timestamp: int) ->
     """Send CMD_051B, receive REPLY_051C."""
     payload = struct.pack("<HBBI", offset, length, 0, timestamp)
     _send(ser, 0x051B, payload, encrypted=False)
-    reply_id, data = _recv(ser, encrypted=False)
+    reply_id, data = _recv(ser, encrypted=True)
     if reply_id != 0x051C:
         raise IOError(f"read_eeprom: got reply 0x{reply_id:04x}")
     return data[4:4 + length]
