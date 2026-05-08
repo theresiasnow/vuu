@@ -459,6 +459,8 @@ def _parse_chirp_row(row: dict) -> dict | None:
         offset_hz = round(float(row.get("Offset") or 0) * 1_000_000)
     except ValueError:
         offset_hz = 0
+    if not duplex:
+        offset_hz = 0
 
     return {
         "index": loc - 1,
