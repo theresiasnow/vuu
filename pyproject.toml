@@ -1,6 +1,6 @@
 [project]
 name = "vuu"
-version = "0.2.0"
+version = "1.0.0"
 description = "UV-K5 channel importer/exporter with GUI and CHIRP CSV support"
 readme = "README.md"
 requires-python = ">=3.14"
