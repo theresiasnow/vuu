@@ -1,7 +1,9 @@
 """VUU — UV-K5 channel importer GUI."""
 import sys
+from pathlib import Path
 import serial.tools.list_ports
 from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QPushButton, QTableWidget, QTableWidgetItem,
@@ -9,6 +11,20 @@ from PySide6.QtWidgets import (
 )
 import csv
 import uvk5
+
+
+def app_icon() -> QIcon:
+    base = Path(__file__).resolve().parent / "assets"
+    icon = QIcon()
+    for size in (16, 32, 48, 64, 128, 256, 512):
+        png = base / f"vuu-{size}.png"
+        if png.exists():
+            icon.addFile(str(png))
+    if icon.isNull():
+        svg = base / "vuu.svg"
+        if svg.exists():
+            icon.addFile(str(svg))
+    return icon
 
 
 COLUMNS = ["#", "Name", "Frequency", "Duplex", "Offset", "Mode", "TX Tone", "RX Tone", "Power", "Step", "BCLO"]
@@ -67,6 +83,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("VUU — UV-K5 Channel Importer")
+        self.setWindowIcon(app_icon())
         self.resize(960, 600)
         self._channels: list[dict] = []
         self._worker: ImportWorker | None = None
@@ -183,7 +200,7 @@ class MainWindow(QMainWindow):
         confirm = QMessageBox(self)
         confirm.setIcon(QMessageBox.Warning)
         confirm.setWindowTitle("Write to radio")
-        confirm.setText(f"Overwrite all 200 channel slots on the radio?")
+        confirm.setText("Overwrite all 200 channel slots on the radio?")
         confirm.setInformativeText(
             f"{len(self._channels)} channel(s) will be written; "
             "remaining slots will be erased. This cannot be undone."
@@ -482,6 +499,8 @@ def _parse_chirp_row(row: dict) -> dict | None:
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setApplicationName("VUU")
+    app.setWindowIcon(app_icon())
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
