@@ -1,7 +1,7 @@
 """Tests for the CSV parser helpers in `main.py`."""
 import pytest
 
-from main import _parse_chirp_row, _parse_csv_row
+from main import _csv_export_row, _csv_safe_cell, _parse_chirp_row, _parse_csv_row
 
 
 # --- _parse_csv_row (VUU's own export format) -------------------------------
@@ -45,6 +45,11 @@ def test_parse_csv_row_returns_none_when_freq_missing():
     row = _vuu_row()
     del row["freq_hz"]
     assert _parse_csv_row(row) is None
+
+
+def test_parse_csv_row_returns_none_when_index_or_step_is_invalid():
+    assert _parse_csv_row(_vuu_row(index="abc")) is None
+    assert _parse_csv_row(_vuu_row(step_khz="abc")) is None
 
 
 def test_parse_csv_row_clamps_bogus_offset():
@@ -156,3 +161,20 @@ def test_parse_chirp_row_returns_none_for_bad_input():
 
 def test_parse_chirp_row_invalid_tstep_falls_back():
     assert _parse_chirp_row(_chirp_row(TStep="garbage"))["step_khz"] == 5.0
+
+
+# --- CSV export safety ------------------------------------------------------
+
+@pytest.mark.parametrize("value", ["=cmd", "+cmd", "-cmd", "@cmd", "  =cmd"])
+def test_csv_safe_cell_neutralizes_spreadsheet_formula_prefixes(value):
+    assert _csv_safe_cell(value) == f"'{value}"
+
+
+def test_csv_safe_cell_preserves_non_formula_values():
+    assert _csv_safe_cell("REPEATER") == "REPEATER"
+    assert _csv_safe_cell(145_500_000) == 145_500_000
+
+
+def test_csv_export_row_sanitizes_strings_only():
+    exported = _csv_export_row({"name": "=HYPERLINK(1)", "freq_hz": 145_500_000})
+    assert exported == {"name": "'=HYPERLINK(1)", "freq_hz": 145_500_000}
