@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Ensure triage labels exist
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const labels = [
@@ -59,7 +59,7 @@ jobs:
 
       - name: Classify issue
         id: inference
-        uses: actions/ai-inference@v1
+        uses: actions/ai-inference@v2
         with:
           model: openai/gpt-4o-mini
           max-completion-tokens: 600
@@ -110,7 +110,7 @@ jobs:
             ${{ github.event.issue.body }}
 
       - name: Apply AI triage
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         env:
           AI_RESPONSE: ${{ steps.inference.outputs.response }}
         with:
