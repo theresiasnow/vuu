@@ -4,6 +4,8 @@ import serial
 
 BAUD_RATE = 38400
 MEM_BLOCK = 0x80
+MAX_CHANNELS = 200
+MAX_EEPROM_RAW = 0xFFFFFFFF
 
 _XOR_KEY = bytes([0x16, 0x6C, 0x14, 0xE6, 0x2E, 0x91, 0x0D, 0x40,
                   0x21, 0x35, 0xD5, 0x40, 0x13, 0x03, 0xE9, 0x80])
@@ -94,6 +96,10 @@ def handshake(ser: serial.Serial) -> tuple[str, bytes]:
 
 def read_eeprom(ser: serial.Serial, offset: int, length: int, session_id: bytes = SESSION_ID) -> bytes:
     """Read `length` bytes from EEPROM at `offset`. length max = 0x80."""
+    if not (0 < length <= MEM_BLOCK):
+        raise ValueError(f"read_eeprom: invalid length ({length})")
+    if not (0 <= offset <= 0xFFFF):
+        raise ValueError(f"read_eeprom: invalid offset ({offset})")
     cmd = (bytes([0x1B, 0x05, 0x08, 0x00]) +
            struct.pack("<HBB", offset, length, 0) +
            session_id)
@@ -205,6 +211,10 @@ def _encode_channel(ch: dict) -> tuple[bytes, int, bytes]:
     """Return (entry_16, attr_byte, name_16) for a channel dict."""
     freq_raw = int(round(ch["freq_hz"] / 10))
     offset_raw = int(round(ch.get("offset_hz", 0) / 10))
+    if not (0 < freq_raw < MAX_EEPROM_RAW):
+        raise ValueError(f"invalid channel frequency: {ch['freq_hz']}")
+    if not (0 <= offset_raw < MAX_EEPROM_RAW):
+        raise ValueError(f"invalid channel offset: {ch.get('offset_hz', 0)}")
 
     rx_mode, rx_code = _parse_tone(ch.get("rx_tone", "None"))
     tx_mode, tx_code = _parse_tone(ch.get("tx_tone", "None"))
@@ -232,10 +242,14 @@ def _encode_channel(ch: dict) -> tuple[bytes, int, bytes]:
 
     step_khz = ch.get("step_khz", 5.0)
     try:
-        step_idx = STEPS_KHZ.index(float(step_khz))
-    except ValueError:
+        step_value = float(step_khz)
+    except (TypeError, ValueError):
+        step_value = 5.0
+    try:
+        step_idx = STEPS_KHZ.index(step_value)
+    except (TypeError, ValueError):
         step_idx = min(range(len(STEPS_KHZ)),
-                       key=lambda i: abs(STEPS_KHZ[i] - float(step_khz)))
+                       key=lambda i: abs(STEPS_KHZ[i] - step_value))
 
     entry = bytearray(16)
     struct.pack_into("<II", entry, 0, freq_raw & 0xFFFFFFFF, offset_raw & 0xFFFFFFFF)
@@ -270,8 +284,10 @@ _FREE_NAME = b"\xFF" * 16
 def write_eeprom(ser: serial.Serial, offset: int, data: bytes,
                  session_id: bytes = SESSION_ID) -> None:
     """Write `data` (max 0x80 bytes) to EEPROM at `offset`."""
-    if len(data) > MEM_BLOCK:
-        raise ValueError(f"write_eeprom: too large ({len(data)} > {MEM_BLOCK})")
+    if not (0 < len(data) <= MEM_BLOCK):
+        raise ValueError(f"write_eeprom: invalid length ({len(data)})")
+    if not (0 <= offset <= 0xFFFF):
+        raise ValueError(f"write_eeprom: invalid offset ({offset})")
     cmd = (bytes([0x1D, 0x05, len(data) + 8, 0x00]) +
            struct.pack("<HBB", offset, len(data), 0) +
            session_id +
@@ -295,14 +311,14 @@ def write_all_channels(ser: serial.Serial, channels: list[dict],
     by_index: dict[int, dict] = {}
     for ch in channels:
         idx = ch.get("index")
-        if idx is None or not (0 <= idx < 200):
+        if idx is None or not (0 <= idx < MAX_CHANNELS):
             continue
         by_index[idx] = ch
 
-    chan_buf = bytearray(200 * 16)
-    attr_buf = bytearray([_FREE_ATTR] * 200)
-    name_buf = bytearray(200 * 16)
-    for i in range(200):
+    chan_buf = bytearray(MAX_CHANNELS * 16)
+    attr_buf = bytearray([_FREE_ATTR] * MAX_CHANNELS)
+    name_buf = bytearray(MAX_CHANNELS * 16)
+    for i in range(MAX_CHANNELS):
         if i in by_index:
             entry, attr, name = _encode_channel(by_index[i])
         else:

@@ -4,7 +4,6 @@
 set -euo pipefail
 
 REPO="theresiasnow/vuu"
-WHEEL_NAME_GLOB="vuu-*-py3-none-any.whl"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -22,8 +21,16 @@ if [[ -z "${ASSET_URL}" ]]; then
 fi
 
 WHEEL="${TMPDIR}/$(basename "$ASSET_URL")"
+CHECKSUMS="${TMPDIR}/SHA256SUMS"
 echo "==> Downloading $(basename "$ASSET_URL")"
 curl -fsSL "$ASSET_URL" -o "$WHEEL"
+curl -fsSL "https://github.com/${REPO}/releases/latest/download/SHA256SUMS" -o "$CHECKSUMS"
+
+echo "==> Verifying SHA-256 checksum"
+(
+  cd "$TMPDIR"
+  grep -F "  $(basename "$WHEEL")" SHA256SUMS | sha256sum -c -
+)
 
 if command -v uv >/dev/null 2>&1; then
   echo "==> Installing with uv tool"

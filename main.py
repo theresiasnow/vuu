@@ -13,6 +13,9 @@ import csv
 import uvk5
 
 
+CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
+
+
 def app_icon() -> QIcon:
     base = Path(__file__).resolve().parent / "assets"
     icon = QIcon()
@@ -310,7 +313,7 @@ class MainWindow(QMainWindow):
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=self._channels[0].keys())
             writer.writeheader()
-            writer.writerows(self._channels)
+            writer.writerows(_csv_export_row(ch) for ch in self._channels)
         self.status_bar.showMessage(f"Saved {len(self._channels)} channels to {path}")
 
     def _import_csv(self):
@@ -385,6 +388,19 @@ class MainWindow(QMainWindow):
         )
 
 
+def _csv_safe_cell(value):
+    if not isinstance(value, str):
+        return value
+    stripped = value.lstrip()
+    if stripped and stripped[0] in CSV_FORMULA_PREFIXES:
+        return f"'{value}"
+    return value
+
+
+def _csv_export_row(row: dict) -> dict:
+    return {key: _csv_safe_cell(value) for key, value in row.items()}
+
+
 def _parse_csv_row(row: dict) -> dict | None:
     """Coerce VUU-format CSV strings back into the channel-dict types used internally."""
     def _to_bool(v):
@@ -393,17 +409,19 @@ def _parse_csv_row(row: dict) -> dict | None:
         s = (v or "").strip()
         return s if s and s != "?" else "None"
     try:
+        index = int(row["index"])
         freq_hz = int(row["freq_hz"])
+        offset_hz = int(row.get("offset_hz") or 0)
+        step_khz = float(row.get("step_khz") or 5.0)
     except (TypeError, ValueError, KeyError):
         return None
     # 0xFFFFFFFF * 10 = 42949672950 Hz — erased EEPROM slot, not a real channel.
     if freq_hz <= 0 or freq_hz >= 42949672950:
         return None
-    offset_hz = int(row.get("offset_hz") or 0)
     if offset_hz < 0 or offset_hz >= 42949672950:
         offset_hz = 0
     return {
-        "index": int(row["index"]),
+        "index": index,
         "name": row.get("name", "").strip(),
         "freq_hz": freq_hz,
         "offset_hz": offset_hz,
@@ -412,7 +430,7 @@ def _parse_csv_row(row: dict) -> dict | None:
         "rx_tone": _norm(row.get("rx_tone")),
         "mode": row.get("mode", "FM") or "FM",
         "power": row.get("power", "Low (1.5W)") or "Low (1.5W)",
-        "step_khz": float(row.get("step_khz") or 5.0),
+        "step_khz": step_khz,
         "bclo": _to_bool(row.get("bclo")),
         "scanlist1": _to_bool(row.get("scanlist1")),
         "scanlist2": _to_bool(row.get("scanlist2")),

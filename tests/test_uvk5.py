@@ -133,3 +133,20 @@ def test_encode_channel_truncates_long_name():
 def test_encode_channel_unknown_power_falls_back_to_low():
     entry, _, _ = uvk5._encode_channel(_sample_channel(power="Bogus"))
     assert (entry[12] >> 2) & 0x03 == 0
+
+
+@pytest.mark.parametrize("freq_hz", [0, -10, 42_949_672_950])
+def test_encode_channel_rejects_invalid_frequency(freq_hz):
+    with pytest.raises(ValueError, match="invalid channel frequency"):
+        uvk5._encode_channel(_sample_channel(freq_hz=freq_hz))
+
+
+@pytest.mark.parametrize("offset_hz", [-10, 42_949_672_950])
+def test_encode_channel_rejects_invalid_offset(offset_hz):
+    with pytest.raises(ValueError, match="invalid channel offset"):
+        uvk5._encode_channel(_sample_channel(offset_hz=offset_hz))
+
+
+def test_encode_channel_invalid_step_falls_back_to_default():
+    entry, _, _ = uvk5._encode_channel(_sample_channel(step_khz="garbage"))
+    assert uvk5.STEPS_KHZ[entry[14]] == 5.0
