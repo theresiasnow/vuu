@@ -1,0 +1,194 @@
+name: AI Issue Triage
+
+on:
+  issues:
+    types:
+      - opened
+
+permissions:
+  contents: read
+  issues: write
+  models: read
+
+jobs:
+  triage:
+    if: ${{ github.event.issue.pull_request == null }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Ensure triage labels exist
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const labels = [
+              ['triage: ai-reviewed', 'Issue has an AI-generated first-pass triage.', 'BFD4F2'],
+              ['question', 'Usage question or support request.', 'D876E3'],
+              ['needs: more-info', 'Reporter should provide more detail before the issue is actionable.', 'D4C5F9'],
+              ['needs: maintainer-review', 'Maintainer should review the AI triage before acting.', 'FBCA04'],
+              ['status: actionable', 'Issue appears actionable from the provided details.', '0E8A16'],
+              ['priority: p0', 'Critical priority: security, data loss, or project-breaking regression.', 'B60205'],
+              ['priority: p1', 'High priority: major user-facing breakage or blocked workflow.', 'D93F0B'],
+              ['priority: p2', 'Normal priority: useful bug fix or improvement.', 'FBCA04'],
+              ['priority: p3', 'Low priority: polish, docs, small enhancement, or unclear impact.', 'C5DEF5'],
+              ['area: gui', 'Graphical interface, Qt, or desktop behavior.', '1D76DB'],
+              ['area: csv', 'CSV import, export, parsing, or spreadsheet compatibility.', '5319E7'],
+              ['area: radio-protocol', 'Serial protocol, EEPROM encoding, or radio read/write behavior.', '006B75'],
+              ['area: install', 'Installation, packaging, releases, or dependencies.', 'D4C5F9'],
+              ['area: ci', 'CI, tests, GitHub Actions, or repository automation.', 'C2E0C6'],
+              ['area: docs', 'Documentation, examples, or project metadata.', '0075CA'],
+            ];
+
+            for (const [name, description, color] of labels) {
+              try {
+                await github.rest.issues.getLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name,
+                });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name,
+                  description,
+                  color,
+                });
+              }
+            }
+
+      - name: Classify issue
+        id: inference
+        uses: actions/ai-inference@v1
+        with:
+          model: openai/gpt-4o-mini
+          max-completion-tokens: 600
+          system-prompt: |
+            You triage GitHub issues for VUU, an open-source Python/PySide6 desktop app
+            for Quansheng UV-K5/UV-K6 radio channel import/export over USB serial.
+
+            Return only compact JSON. Do not use markdown.
+            Choose exactly one priority, one status, and one area label from the allowed labels.
+            Be conservative: when details are missing, choose needs: more-info and priority: p3.
+            Escalate to priority: p0 only for plausible security issues, data loss, radio memory
+            corruption, or a release/install supply-chain problem.
+
+            Allowed priority labels:
+            - priority: p0
+            - priority: p1
+            - priority: p2
+            - priority: p3
+
+            Allowed status labels:
+            - status: actionable
+            - needs: more-info
+
+            Allowed area labels:
+            - area: gui
+            - area: csv
+            - area: radio-protocol
+            - area: install
+            - area: ci
+            - area: docs
+
+            JSON schema:
+            {
+              "priority": "priority: p2",
+              "status": "status: actionable",
+              "area": "area: csv",
+              "summary": "One sentence summary.",
+              "rationale": "One short sentence explaining the classification.",
+              "next_step": "One concrete maintainer or reporter action."
+            }
+          prompt: |
+            Classify this new issue.
+
+            Title:
+            ${{ github.event.issue.title }}
+
+            Body:
+            ${{ github.event.issue.body }}
+
+      - name: Apply AI triage
+        uses: actions/github-script@v8
+        env:
+          AI_RESPONSE: ${{ steps.inference.outputs.response }}
+        with:
+          script: |
+            const allowed = {
+              priority: new Set(['priority: p0', 'priority: p1', 'priority: p2', 'priority: p3']),
+              status: new Set(['status: actionable', 'needs: more-info']),
+              area: new Set([
+                'area: gui',
+                'area: csv',
+                'area: radio-protocol',
+                'area: install',
+                'area: ci',
+                'area: docs',
+              ]),
+            };
+
+            function parseResponse(raw) {
+              const trimmed = (raw || '').trim();
+              try {
+                return JSON.parse(trimmed);
+              } catch {
+                const match = trimmed.match(/\{[\s\S]*\}/);
+                if (!match) throw new Error('AI response did not contain JSON');
+                return JSON.parse(match[0]);
+              }
+            }
+
+            let result;
+            try {
+              result = parseResponse(process.env.AI_RESPONSE);
+            } catch (error) {
+              result = {
+                priority: 'priority: p3',
+                status: 'needs: more-info',
+                area: 'area: docs',
+                summary: 'AI triage could not parse a reliable classification.',
+                rationale: error.message,
+                next_step: 'A maintainer should review this issue manually.',
+              };
+            }
+
+            const labels = ['triage: ai-reviewed', 'needs: maintainer-review'];
+            for (const [field, values] of Object.entries(allowed)) {
+              if (values.has(result[field])) {
+                labels.push(result[field]);
+              }
+            }
+
+            if (!labels.some((label) => allowed.priority.has(label))) labels.push('priority: p3');
+            if (!labels.some((label) => allowed.status.has(label))) labels.push('needs: more-info');
+            if (!labels.some((label) => allowed.area.has(label))) labels.push('area: docs');
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels,
+            });
+
+            const summary = String(result.summary || 'No summary provided.').slice(0, 500);
+            const rationale = String(result.rationale || 'No rationale provided.').slice(0, 500);
+            const nextStep = String(result.next_step || 'Maintainer should review.').slice(0, 500);
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                'AI triage suggestion:',
+                '',
+                `- Priority: \`${labels.find((label) => allowed.priority.has(label))}\``,
+                `- Area: \`${labels.find((label) => allowed.area.has(label))}\``,
+                `- Status: \`${labels.find((label) => allowed.status.has(label))}\``,
+                `- Summary: ${summary}`,
+                `- Rationale: ${rationale}`,
+                `- Next step: ${nextStep}`,
+                '',
+                'A maintainer should verify this before relying on it.',
+              ].join('\n'),
+            });
